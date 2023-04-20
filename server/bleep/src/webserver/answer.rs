@@ -35,6 +35,9 @@ use crate::{
 mod llm_gateway;
 mod partial_parse;
 mod prompts;
+mod response;
+
+use response::{ResponseState, SearchResult, SearchStep, Update};
 
 #[derive(Default)]
 pub struct RouteState {
@@ -82,6 +85,7 @@ pub(super) async fn handle(
     let q = params.q;
     let stream = async_stream::try_stream! {
         let mut action_stream = Action::Query(q).into()?;
+        let mut full_update = ResponseState::new(&conversation_id, &conversation);
 
         loop {
             // The main loop. Here, we create two streams that operate simultaneously; the update
@@ -91,7 +95,8 @@ pub(super) async fn handle(
 
             use futures::future::FutureExt;
 
-            let (update_tx, update_rx) = tokio::sync::mpsc::channel(10);
+
+            let (update_tx, update_rx) = tokio::sync::mpsc::channel(100);
 
             let left_stream = tokio_stream::wrappers::ReceiverStream::new(update_rx)
                 .map(Either::Left);
@@ -104,7 +109,10 @@ pub(super) async fn handle(
             let mut next = None;
             for await item in stream::select(left_stream, right_stream) {
                 match item {
-                    Either::Left(upd) => yield upd,
+                    Either::Left(upd) => {
+                        full_update.apply_update(upd);
+                        yield full_update.clone()
+                    },
                     Either::Right(n) => next = n?,
                 }
             }
@@ -114,6 +122,15 @@ pub(super) async fn handle(
                 None => break,
             }
         }
+
+        // TODO: add `conclusion` of last assistant response to history
+        //       currently, history is not user-facing history.
+        //
+        // conversation
+        //     .history
+        //     .push(llm_gateway::api::Message::assistant(
+        //         full_update.conclusion().unwrap_or_default(),
+        //     ));
 
         // Storing the conversation here allows us to make subsequent requests.
         state.conversations
@@ -132,13 +149,13 @@ pub(super) async fn handle(
 }
 
 #[derive(Hash, PartialEq, Eq)]
-struct ConversationId {
+pub(super) struct ConversationId {
     thread_id: String,
     user_id: String,
 }
 
 #[derive(Clone, Debug)]
-struct Conversation {
+pub(super) struct Conversation {
     history: Vec<llm_gateway::api::Message>,
     path_aliases: Vec<String>,
     repo_ref: RepoRef,
@@ -175,7 +192,7 @@ impl Conversation {
         action_stream: ActionStream,
         update: Sender<Update>,
     ) -> Result<Option<ActionStream>> {
-        let (action, raw_response) = action_stream.load(&update).await?;
+        let (action, raw_response) = action_stream.load().await.unwrap();
 
         if !matches!(action, Action::Query(..)) {
             self.history
@@ -184,20 +201,36 @@ impl Conversation {
         }
 
         let question = match action {
-            Action::Query(s) => parser::parse_nl(&s)?
-                .target
-                .context("query was empty")?
-                .as_plain()
-                .context("user query was not plain text")?
-                .clone()
-                .into_owned(),
+            Action::Query(s) => {
+                update
+                    .send(Update::Step(SearchStep::Query(s.clone())))
+                    .await
+                    .unwrap();
+                parser::parse_nl(&s)?
+                    .target
+                    .context("query was empty")?
+                    .as_plain()
+                    .context("user query was not plain text")?
+                    .clone()
+                    .into_owned()
+            }
 
             Action::Prompt(_) => {
+                update
+                    .send(Update::Step(SearchStep::Prompt("awaiting prompt".into())))
+                    .await
+                    .unwrap();
                 return Ok(None);
             }
 
             Action::Answer(rephrased_question) => {
-                self.answer(ctx, update, &rephrased_question).await?;
+                self.answer(
+                    ctx,
+                    update,
+                    &rephrased_question,
+                    self.path_aliases.as_slice(),
+                )
+                .await?;
                 let r: Result<ActionStream> = Action::Prompt(prompts::CONTINUE.to_owned()).into();
                 return Ok(Some(r?));
             }
@@ -212,7 +245,6 @@ impl Conversation {
                     .fuzzy_path_match(&self.repo_ref, &search, /* limit */ 50)
                     .await
                     .map(|c| c.relative_path)
-                    .map(|p| format!("{}, {p}", self.path_alias(&p)))
                     .collect::<Vec<_>>();
 
                 // If there are no lexical results, perform a semantic search.
@@ -223,7 +255,7 @@ impl Conversation {
                         ..Default::default()
                     };
 
-                    let mut semantic_paths: Vec<String> = ctx
+                    let semantic_paths = ctx
                         .app
                         .semantic
                         .as_ref()
@@ -238,19 +270,31 @@ impl Conversation {
                                 .collect::<HashMap<_, _>>()
                         })
                         .map(|chunk| {
-                            let relative_path = chunk["relative_path"].as_str().unwrap();
-                            format!("{}, {relative_path}", self.path_alias(relative_path))
+                            // let relative_path = chunk["relative_path"].as_str().unwrap();
+                            // format!("{}, {relative_path}", self.path_alias(relative_path))
+                            chunk["relative_path"].as_str().unwrap().to_owned()
                         })
                         .collect::<HashSet<_>>()
                         .into_iter()
                         .collect();
 
-                    paths.append(&mut semantic_paths);
+                    paths = semantic_paths;
+                }
+
+                for u in paths
+                    .iter()
+                    .map(|p| Update::Step(SearchStep::Path(p.clone())))
+                {
+                    update.send(u).await.unwrap();
                 }
 
                 Some("§alias, path".to_owned())
                     .into_iter()
-                    .chain(paths)
+                    .chain(
+                        paths
+                            .iter()
+                            .map(|p| format!("{}, {p}", self.path_alias(&p))),
+                    )
                     .collect::<Vec<_>>()
                     .join("\n")
             }
@@ -267,6 +311,11 @@ impl Conversation {
                     FileRef::Path(p) => p,
                 };
 
+                update
+                    .send(Update::Step(SearchStep::File(path.clone())))
+                    .await
+                    .unwrap();
+
                 ctx.app
                     .indexes
                     .file
@@ -277,6 +326,11 @@ impl Conversation {
 
             Action::Code(query) => {
                 // Semantic search.
+
+                update
+                    .send(Update::Step(SearchStep::Code(query.clone())))
+                    .await
+                    .unwrap();
 
                 let nl_query = NLQuery {
                     target: Some(parser::Literal::Plain(Cow::Owned(query))),
@@ -313,7 +367,7 @@ impl Conversation {
             }
 
             Action::Check(question, path_aliases) => {
-                self.check(ctx, question, path_aliases).await?
+                self.check(ctx, update, question, path_aliases).await?
             }
         };
 
@@ -333,6 +387,7 @@ impl Conversation {
     async fn check(
         &mut self,
         ctx: &AppContext,
+        update: Sender<Update>,
         question: String,
         path_aliases: Vec<usize>,
     ) -> Result<String> {
@@ -341,6 +396,13 @@ impl Conversation {
             .map(|i| self.path_aliases.get(i).ok_or(i))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|i| anyhow!("invalid path alias {i}"))?;
+
+        for u in paths
+            .iter()
+            .map(|&p| Update::Step(SearchStep::File(p.clone())))
+        {
+            update.send(u).await.unwrap();
+        }
 
         let question = &question;
         let ctx = &ctx.clone().model("gpt-3.5-turbo");
@@ -412,7 +474,13 @@ impl Conversation {
         Ok(serde_json::to_string(&out)?)
     }
 
-    async fn answer(&self, ctx: &AppContext, update: Sender<Update>, question: &str) -> Result<()> {
+    async fn answer(
+        &self,
+        ctx: &AppContext,
+        update: Sender<Update>,
+        question: &str,
+        path_aliases: &[String],
+    ) -> Result<()> {
         let messages = self
             .history
             .iter()
@@ -430,10 +498,19 @@ impl Conversation {
         while let Some(token) = stream.next().await {
             buffer += &token?;
             let (s, _) = partial_parse::rectify_json(&buffer);
-            update
-                .send(Update::Answer(s.into_owned()))
-                .await
-                .or(Err(anyhow!("failed to send answer update")))?;
+
+            // this /should/ be infallible if rectify_json works
+            let json_array: Vec<Vec<serde_json::Value>> =
+                serde_json::from_str(&s).expect("failed to rectify_json");
+
+            let search_results = json_array
+                .iter()
+                .map(Vec::as_slice)
+                .filter_map(SearchResult::from_json_array)
+                .map(|s| s.substitute_path_alias(path_aliases))
+                .collect::<Vec<_>>();
+
+            update.send(Update::Result(search_results)).await?;
         }
 
         Ok(())
@@ -463,19 +540,6 @@ enum FileRef {
 }
 
 impl Action {
-    /// Map this action to a summary update.
-    fn update(&self) -> Update {
-        match self {
-            Self::Answer(..) => Update::Answering,
-            Self::Prompt(s) => Update::Prompt(s.clone()),
-            Self::Query(..) => Update::ProcessingQuery,
-            Self::Code(..) => Update::SearchingFiles,
-            Self::Path(..) => Update::SearchingFiles,
-            Self::File(..) => Update::LoadingFiles,
-            Self::Check(..) => Update::Answering,
-        }
-    }
-
     /// Deserialize this action from the GPT-tagged enum variant format.
     ///
     /// We convert:
@@ -544,16 +608,6 @@ impl Action {
     }
 }
 
-#[derive(serde::Serialize)]
-enum Update {
-    Prompt(String),
-    Answer(String),
-    ProcessingQuery,
-    SearchingFiles,
-    Answering,
-    LoadingFiles,
-}
-
 /// An action that may not have finished loading yet.
 struct ActionStream {
     tokens: String,
@@ -562,14 +616,10 @@ struct ActionStream {
 
 impl ActionStream {
     /// Load this action, consuming the stream if required.
-    async fn load(mut self, update: &Sender<Update>) -> Result<(Action, String)> {
+    async fn load(mut self) -> Result<(Action, String)> {
         let mut stream = match self.action {
             Either::Left(stream) => stream,
             Either::Right(action) => {
-                update
-                    .send(action.update())
-                    .await
-                    .or(Err(anyhow!("failed to send update")))?;
                 return Ok((action, self.tokens));
             }
         };
@@ -579,11 +629,6 @@ impl ActionStream {
         }
 
         let action = Action::deserialize_gpt(&self.tokens)?;
-        update
-            .send(action.update())
-            .await
-            .or(Err(anyhow!("failed to send update")))?;
-
         Ok((action, self.tokens))
     }
 }
