@@ -389,10 +389,12 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 pub fn deduplicate_with_mmr(
     query_embedding: &[f32],
     embeddings: &[&[f32]],
+    languages: &[&str],
     lambda: f32,
     k: usize,
 ) -> Vec<usize> {
     let mut idxs = vec![];
+    let mut lang_counts = HashMap::new();
 
     if embeddings.len() < k {
         return (0..embeddings.len()).collect();
@@ -414,7 +416,12 @@ pub fn deduplicate_with_mmr(
                     second_part = cos_sim;
                 }
             }
-            let equation_score = lambda * first_part - (1. - lambda) * second_part;
+            let mut equation_score = lambda * first_part - (1. - lambda) * second_part;
+
+            // score is MMR + (1/4)^n where n is the number of times a language has been selected
+            let count = lang_counts.get(languages[i]).unwrap_or(&0);
+            equation_score += 0.25_f32.powi(*count);
+
             if equation_score > best_score {
                 best_score = equation_score;
                 idx_to_add = Some(i);
@@ -422,6 +429,7 @@ pub fn deduplicate_with_mmr(
         }
         if let Some(i) = idx_to_add {
             idxs.push(i);
+            *lang_counts.entry(languages[i]).or_insert(0) += 1;
         }
     }
     idxs
