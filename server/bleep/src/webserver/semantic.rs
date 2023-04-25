@@ -45,7 +45,6 @@ pub(super) async fn raw_chunks(
             .map(|r| {
                 use qdrant_client::qdrant::{value::Kind, Value};
 
-                // TODO: Can we merge with webserver/semantic.rs:L63?
                 fn value_to_string(value: Value) -> String {
                     match value.kind.unwrap() {
                         Kind::StringValue(s) => s,
@@ -63,7 +62,6 @@ pub(super) async fn raw_chunks(
                 }
 
                 let embedding = extract_vector(&r);
-
                 let mut s = r.payload;
 
                 Snippet {
