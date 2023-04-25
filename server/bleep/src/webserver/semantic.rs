@@ -1,9 +1,12 @@
 use super::prelude::*;
-use crate::{query::parser, semantic::Semantic};
+use crate::{
+    query::parser,
+    semantic::Semantic,
+    webserver::answer::{deduplicate_snippets, Snippet},
+};
 use tracing::error;
 
-use qdrant_client::qdrant::value::Kind;
-use std::collections::HashMap;
+use qdrant_client::qdrant::{vectors, ScoredPoint};
 
 #[derive(Deserialize)]
 pub(super) struct Args {
@@ -13,7 +16,7 @@ pub(super) struct Args {
 
 #[derive(Serialize)]
 pub(super) struct SemanticResponse {
-    chunks: Vec<serde_json::Value>,
+    snippets: Vec<Snippet>,
 }
 
 impl super::ApiResponse for SemanticResponse {}
@@ -33,52 +36,76 @@ pub(super) async fn raw_chunks(
 ) -> impl IntoResponse {
     if let Some(semantic) = semantic {
         let Args { ref query, limit } = args;
-        let query = parser::parse_nl(query).unwrap();
-        let result = semantic.search(&query, limit).await.and_then(|raw| {
-            raw.into_iter()
-                .map(|v| {
-                    v.payload
-                        .into_iter()
-                        .map(|(k, v)| (k, kind_to_value(v.kind)))
-                        .collect::<HashMap<_, _>>()
-                })
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.into())
-        });
+        let parsed_query = parser::parse_nl(query).unwrap();
+        let all_snippets: Vec<Snippet> = semantic
+            .search(&parsed_query, 4 * limit) // heuristic
+            .await
+            .map_err(Error::internal)?
+            .into_iter()
+            .map(|r| {
+                use qdrant_client::qdrant::{value::Kind, Value};
 
-        if let Err(err) = result {
-            error!(?err, "qdrant query failed");
-            return Err(Error::new(ErrorKind::UpstreamService, "error"));
-        };
+                // TODO: Can we merge with webserver/semantic.rs:L63?
+                fn value_to_string(value: Value) -> String {
+                    match value.kind.unwrap() {
+                        Kind::StringValue(s) => s,
+                        _ => panic!("got non-string value"),
+                    }
+                }
 
-        Ok(json(SemanticResponse {
-            chunks: result.unwrap(),
-        }))
+                fn extract_vector(point: &ScoredPoint) -> Vec<f32> {
+                    if let Some(vectors) = &point.vectors {
+                        if let Some(vectors::VectorsOptions::Vector(v)) = &vectors.vectors_options {
+                            return v.data.clone();
+                        }
+                    }
+                    panic!("got non-vector value");
+                }
+
+                let embedding = extract_vector(&r);
+
+                let mut s = r.payload;
+
+                Snippet {
+                    lang: value_to_string(s.remove("lang").unwrap()),
+                    repo_name: value_to_string(s.remove("repo_name").unwrap()),
+                    repo_ref: value_to_string(s.remove("repo_ref").unwrap()),
+                    relative_path: value_to_string(s.remove("relative_path").unwrap()),
+                    text: value_to_string(s.remove("snippet").unwrap()),
+
+                    start_line: value_to_string(s.remove("start_line").unwrap())
+                        .parse::<usize>()
+                        .unwrap(),
+                    end_line: value_to_string(s.remove("end_line").unwrap())
+                        .parse::<usize>()
+                        .unwrap(),
+                    start_byte: value_to_string(s.remove("start_byte").unwrap())
+                        .parse::<usize>()
+                        .unwrap(),
+                    end_byte: value_to_string(s.remove("end_byte").unwrap())
+                        .parse::<usize>()
+                        .unwrap(),
+                    score: r.score,
+                    embedding,
+                }
+            })
+            .collect();
+
+        let query_target = parsed_query
+            .target()
+            .ok_or_else(|| Error::user("empty search"))?
+            .to_string();
+        let query_embedding = semantic.embed(&query_target).map_err(|e| {
+            error!("failed to embed query: {}", e);
+            Error::internal(e)
+        })?;
+
+        let snippets = deduplicate_snippets(all_snippets, query_embedding, limit as usize);
+        Ok(json(SemanticResponse { snippets }))
     } else {
         Err(Error::new(
             ErrorKind::Configuration,
             "Qdrant not configured",
         ))
-    }
-}
-
-fn kind_to_value(kind: Option<Kind>) -> serde_json::Value {
-    match kind {
-        Some(Kind::NullValue(_)) => serde_json::Value::Null,
-        Some(Kind::BoolValue(v)) => serde_json::Value::Bool(v),
-        Some(Kind::DoubleValue(v)) => {
-            serde_json::Value::Number(serde_json::Number::from_f64(v).unwrap())
-        }
-        Some(Kind::IntegerValue(v)) => serde_json::Value::Number(v.into()),
-        Some(Kind::StringValue(v)) => serde_json::Value::String(v),
-        Some(Kind::ListValue(v)) => serde_json::Value::Array(
-            v.values
-                .into_iter()
-                .map(|v| kind_to_value(v.kind))
-                .collect(),
-        ),
-        Some(Kind::StructValue(_v)) => todo!(),
-        None => serde_json::Value::Null,
     }
 }

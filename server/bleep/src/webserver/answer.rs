@@ -269,9 +269,12 @@ async fn search_snippets(
     Ok(all_snippets)
 }
 
-fn deduplicate_snippets(all_snippets: Vec<Snippet>, query_embedding: Vec<f32>) -> Vec<Snippet> {
+pub fn deduplicate_snippets(
+    all_snippets: Vec<Snippet>,
+    query_embedding: Vec<f32>,
+    k: usize,
+) -> Vec<Snippet> {
     let lambda = 0.5;
-    let k = SNIPPET_COUNT; // number of snippets
     let embeddings = all_snippets
         .iter()
         .map(|s| s.embedding.as_slice())
@@ -447,7 +450,8 @@ async fn handle_inner(
                     error!("failed to embed query: {}", e);
                     Error::internal(e)
                 })?;
-                let filtered_snippets = deduplicate_snippets(all_snippets, query_embedding);
+                let filtered_snippets =
+                    deduplicate_snippets(all_snippets, query_embedding, SNIPPET_COUNT);
 
                 event.write().await.stages.push(
                     Stage::new("filtered_semantic_results", &filtered_snippets)
