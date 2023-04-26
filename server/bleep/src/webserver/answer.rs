@@ -85,7 +85,7 @@ pub(super) async fn handle(
     let q = params.q;
     let stream = async_stream::try_stream! {
         let mut action_stream = Action::Query(q).into()?;
-        let mut full_update = ResponseState::new(&conversation_id, &conversation);
+        let mut response = ResponseState::new(&conversation_id, &conversation);
 
         loop {
             // The main loop. Here, we create two streams that operate simultaneously; the update
@@ -96,7 +96,7 @@ pub(super) async fn handle(
             use futures::future::FutureExt;
 
 
-            let (update_tx, update_rx) = tokio::sync::mpsc::channel(100);
+            let (update_tx, update_rx) = tokio::sync::mpsc::channel(10);
 
             let left_stream = tokio_stream::wrappers::ReceiverStream::new(update_rx)
                 .map(Either::Left);
@@ -110,8 +110,8 @@ pub(super) async fn handle(
             for await item in stream::select(left_stream, right_stream) {
                 match item {
                     Either::Left(upd) => {
-                        full_update.apply_update(upd);
-                        yield full_update.clone()
+                        response.apply_update(upd);
+                        yield response.clone()
                     },
                     Either::Right(n) => next = n?,
                 }
@@ -123,15 +123,7 @@ pub(super) async fn handle(
             }
         }
 
-        // TODO: add `conclusion` of last assistant response to history
-        //       currently, history is not user-facing history.
-        //
-        // conversation
-        //     .history
-        //     .push(llm_gateway::api::Message::assistant(
-        //         full_update.conclusion().unwrap_or_default(),
-        //     ));
-
+        // TODO: add `conclusion` of last assistant response to history here
         // Storing the conversation here allows us to make subsequent requests.
         state.conversations
             .entry_async(conversation_id)
@@ -192,7 +184,7 @@ impl Conversation {
         action_stream: ActionStream,
         update: Sender<Update>,
     ) -> Result<Option<ActionStream>> {
-        let (action, raw_response) = action_stream.load().await.unwrap();
+        let (action, raw_response) = action_stream.load().await?;
 
         if !matches!(action, Action::Query(..)) {
             self.history
@@ -204,8 +196,8 @@ impl Conversation {
             Action::Query(s) => {
                 update
                     .send(Update::Step(SearchStep::Query(s.clone())))
-                    .await
-                    .unwrap();
+                    .await?;
+
                 parser::parse_nl(&s)?
                     .target
                     .context("query was empty")?
@@ -218,8 +210,8 @@ impl Conversation {
             Action::Prompt(_) => {
                 update
                     .send(Update::Step(SearchStep::Prompt("awaiting prompt".into())))
-                    .await
-                    .unwrap();
+                    .await?;
+
                 return Ok(None);
             }
 
@@ -269,11 +261,7 @@ impl Conversation {
                                 .map(|(k, v)| (k, super::semantic::kind_to_value(v.kind)))
                                 .collect::<HashMap<_, _>>()
                         })
-                        .map(|chunk| {
-                            // let relative_path = chunk["relative_path"].as_str().unwrap();
-                            // format!("{}, {relative_path}", self.path_alias(relative_path))
-                            chunk["relative_path"].as_str().unwrap().to_owned()
-                        })
+                        .map(|chunk| chunk["relative_path"].as_str().unwrap().to_owned())
                         .collect::<HashSet<_>>()
                         .into_iter()
                         .collect();
@@ -285,7 +273,7 @@ impl Conversation {
                     .iter()
                     .map(|p| Update::Step(SearchStep::Path(p.clone())))
                 {
-                    update.send(u).await.unwrap();
+                    update.send(u).await?;
                 }
 
                 Some("§alias, path".to_owned())
@@ -313,8 +301,7 @@ impl Conversation {
 
                 update
                     .send(Update::Step(SearchStep::File(path.clone())))
-                    .await
-                    .unwrap();
+                    .await?;
 
                 ctx.app
                     .indexes
@@ -329,8 +316,7 @@ impl Conversation {
 
                 update
                     .send(Update::Step(SearchStep::Code(query.clone())))
-                    .await
-                    .unwrap();
+                    .await?;
 
                 let nl_query = NLQuery {
                     target: Some(parser::Literal::Plain(Cow::Owned(query))),
@@ -399,9 +385,9 @@ impl Conversation {
 
         for u in paths
             .iter()
-            .map(|&p| Update::Step(SearchStep::File(p.clone())))
+            .map(|&p| Update::Step(SearchStep::Check(p.clone())))
         {
-            update.send(u).await.unwrap();
+            update.send(u).await?;
         }
 
         let question = &question;
@@ -569,7 +555,7 @@ impl Action {
         let action = action.as_str().context("model action was not a string")?;
 
         let value = if array.len() < 2 {
-            array.pop().unwrap_or(serde_json::Value::Null)
+            array.pop().unwrap_or_default()
         } else {
             array.into()
         };
