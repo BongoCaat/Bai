@@ -33,7 +33,6 @@ pub(in crate::webserver) mod prelude {
     };
     pub(in crate::webserver) use serde::{Deserialize, Serialize};
     pub(in crate::webserver) use std::sync::Arc;
-    pub(in crate::webserver) use utoipa::{IntoParams, ToSchema};
 }
 
 pub async fn start(app: Application) -> anyhow::Result<()> {
