@@ -23,6 +23,7 @@ pub enum Target<'a> {
     Content(Literal<'a>),
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParsedQuery<'a> {
     Semantic(SemanticQuery<'a>),
